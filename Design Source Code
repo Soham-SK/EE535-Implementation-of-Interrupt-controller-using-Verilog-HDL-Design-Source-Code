@@ -1,0 +1,369 @@
+
+module myclk (
+    input  clk,
+    output reg my_clk = 1'b0
+);
+    reg [25:0] cnt = 0;
+
+    always @(posedge clk) begin
+        if (cnt < 3)
+            cnt <= cnt + 1;
+        else begin
+            cnt <= 0;
+            my_clk <= ~my_clk;
+        end
+    end
+endmodule
+
+
+module interrupt_masking (
+    input        clk,
+    input        enable,
+    input  [7:0] interrupt,
+    output [7:0] masked_interrupt
+);
+    reg [7:0] mask_reg;
+
+    always @(posedge clk) begin
+        mask_reg <= (enable ? 8'b00000000 : 8'b11111111);
+    end
+
+    assign masked_interrupt = interrupt & mask_reg;
+
+endmodule
+
+
+module InterruptController (
+    input  wire        clock,
+    input  wire        reset,
+    input  wire        mask,
+    input  wire [7:0]  intr_rq_1,
+    inout  wire [7:0]  data_bus,
+    input  wire        acknowledgement,
+    output wire        interrupt_out,
+    output wire        enable
+);
+
+ 
+    wire clk;
+    wire [7:0] intr_rq_masked;
+
+    reg [3:0] state, next_state;
+    reg [1:0] cmd_mode, next_cmd_mode;
+    reg [1:0] cmd_cycle, next_cmd_cycle;
+
+    reg [2:0] intr_index, next_intr_index;
+    reg [2:0] intr_ptr, next_intr_ptr;
+
+    reg oe, next_oe;
+    reg [7:0] intr_bus, next_intr_bus;
+    reg intr_out, next_intr_out;
+
+    reg [2:0] priority_table [0:7];
+    reg [2:0] priority_table_next [0:7];
+
+    integer k;
+
+ 
+   
+assign clk = clock;
+
+    interrupt_masking mask_unit (
+        .clk(clk),
+        .enable(mask),
+        .interrupt(intr_rq_1),
+        .masked_interrupt(intr_rq_masked)
+    );
+
+    localparam S_RESET     = 4'd0,
+               S_GETCMD    = 4'd1,
+               S_JUMPMODE  = 4'd2,
+               S_POLL      = 4'd3,
+               S_TXPOLL    = 4'd4,
+               S_ACK1P     = 4'd5,
+               S_ACK2P     = 4'd6,
+               S_PRI_START = 4'd7,
+               S_TXPRI     = 4'd8,
+               S_ACK1PRI   = 4'd9,
+               S_ACK2PRI   = 4'd10;
+
+   
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            state <= S_RESET;
+            cmd_mode <= 0;
+            cmd_cycle <= 0;
+            intr_index <= 0;
+            intr_ptr <= 0;
+
+            for (k = 0; k < 8; k = k + 1)
+                priority_table[k] <= 0;
+
+            oe <= 0;
+            intr_bus <= 8'hZZ;
+            intr_out <= 0;
+        end else begin
+            state <= next_state;
+            cmd_mode <= next_cmd_mode;
+            cmd_cycle <= next_cmd_cycle;
+            intr_index <= next_intr_index;
+            intr_ptr <= next_intr_ptr;
+            oe <= next_oe;
+            intr_bus <= next_intr_bus;
+            intr_out <= next_intr_out;
+
+            for (k = 0; k < 8; k = k + 1)
+                priority_table[k] <= priority_table_next[k];
+        end
+    end
+
+   
+    always @* begin
+        next_state = state;
+        next_cmd_mode = cmd_mode;
+        next_cmd_cycle = cmd_cycle;
+        next_intr_index = intr_index;
+        next_intr_ptr = intr_ptr;
+
+        next_oe = 0;
+        next_intr_out = 0;
+        next_intr_bus = 8'hZZ;
+
+        for (k = 0; k < 8; k = k + 1)
+            priority_table_next[k] = priority_table[k];
+
+        case (state)
+
+            S_RESET: begin
+                next_state = S_GETCMD;
+            end
+
+            S_GETCMD: begin
+                case (data_bus[1:0])
+                    2'b01: begin
+                        next_cmd_mode = 2'b01;
+                        next_state = S_JUMPMODE;
+                    end
+                    2'b10: begin
+                        case (cmd_cycle)
+                            2'd0: begin
+                                priority_table_next[0] = data_bus[7:5];
+                                priority_table_next[1] = data_bus[4:2];
+                                next_cmd_cycle = 1;
+                            end
+                            2'd1: begin
+                                priority_table_next[2] = data_bus[7:5];
+                                priority_table_next[3] = data_bus[4:2];
+                                next_cmd_cycle = 2;
+                            end
+                            2'd2: begin
+                                priority_table_next[4] = data_bus[7:5];
+                                priority_table_next[5] = data_bus[4:2];
+                                next_cmd_cycle = 3;
+                            end
+                            2'd3: begin
+                                priority_table_next[6] = data_bus[7:5];
+                                priority_table_next[7] = data_bus[4:2];
+                                next_cmd_mode = 2'b10;
+                                next_cmd_cycle = 0;
+                                next_state = S_JUMPMODE;
+                            end
+                        endcase
+                    end
+                endcase
+            end
+
+            S_JUMPMODE: begin
+                case (cmd_mode)
+                    2'b01: next_state = S_POLL;
+                    2'b10: next_state = S_PRI_START;
+                    default: next_state = S_RESET;
+                endcase
+            end
+
+            S_POLL: begin
+                if (intr_rq_masked[intr_index]) begin
+                    next_intr_out = 1;
+                    next_state = S_TXPOLL;
+                end else begin
+                    next_intr_index = intr_index + 1;
+                end
+            end
+
+            S_TXPOLL: begin
+                if (!acknowledgement) begin
+                    next_intr_bus = {5'b01011, intr_index};
+                    next_oe = 1;
+                    next_state = S_ACK1P;
+                end
+            end
+
+            S_ACK1P: begin
+                if (!acknowledgement)
+                    next_state = S_ACK2P;
+            end
+
+            S_ACK2P: begin
+                if (!acknowledgement &&
+                    data_bus[7:3] == 5'b10100 &&
+                    data_bus[2:0] == intr_index)
+                    next_state = S_POLL;
+                else if (!acknowledgement)
+                    next_state = S_RESET;
+            end
+
+            S_PRI_START: begin
+                for (k = 0; k < 8; k = k + 1)
+                    if (intr_rq_masked[priority_table[k]]) begin
+                        next_intr_ptr = priority_table[k];
+                        next_intr_out = 1;
+                        next_state = S_TXPRI;
+                    end
+            end
+
+            S_TXPRI: begin
+                if (!acknowledgement) begin
+                    next_intr_bus = {5'b10011, intr_ptr};
+                    next_oe = 1;
+                    next_state = S_ACK1PRI;
+                end
+            end
+
+            S_ACK1PRI: begin
+                if (!acknowledgement)
+                    next_state = S_ACK2PRI;
+            end
+
+            S_ACK2PRI: begin
+                if (!acknowledgement &&
+                    data_bus[7:3] == 5'b01100 &&
+                    data_bus[2:0] == intr_ptr)
+                    next_state = S_PRI_START;
+                else if (!acknowledgement)
+                    next_state = S_RESET;
+            end
+        endcase
+    end
+
+  
+    assign interrupt_out = intr_out;
+    assign data_bus = (oe ? intr_bus : 8'hZZ);
+    assign enable = oe;
+
+endmodule
+
+
+
+
+module InterruptController_TB;
+
+    parameter CLK_PERIOD = 10;
+
+    // DUT Inputs
+    reg clock;
+    reg reset;
+    reg mask;
+    reg acknowledgement;
+    reg [7:0] intr_rq_1;
+
+    // Bidirectional bus driver
+    reg  [7:0] data_bus_reg;
+    wire [7:0] data_bus_wire;
+
+    // DUT Outputs
+    wire interrupt_out;
+    wire enable;
+
+    
+    InterruptController DUT (
+        .clock(clock),
+        .reset(reset),
+        .mask(mask),
+        .intr_rq_1(intr_rq_1),
+        .data_bus(data_bus_wire),
+        .acknowledgement(acknowledgement),
+        .interrupt_out(interrupt_out),
+        .enable(enable)
+    );
+
+   
+    assign data_bus_wire = enable ? 8'hZZ : data_bus_reg;
+
+ 
+    always #(CLK_PERIOD/2) clock = ~clock;
+
+  
+    initial begin
+        clock = 0;
+        reset = 1;
+        mask = 0;
+        acknowledgement = 0;
+        intr_rq_1 = 8'h00;
+        data_bus_reg = 8'h00;
+
+        #50 reset = 0;
+    end
+
+  
+    initial begin
+        #100;
+
+        // Command: Polling mode -> data_bus[1:0] = 01
+        data_bus_reg = 8'b00000001;
+        #30;
+
+        // Trigger interrupt on line 0
+        intr_rq_1 = 8'b00000001;
+        #60;
+
+        // CPU acknowledges
+        acknowledgement = 1;
+        #20 acknowledgement = 0;
+
+        // ISR DONE for line 0 -> 10100 + 000
+        data_bus_reg = 8'b10100000;
+        #40;
+
+        // Trigger interrupt on line 1
+        intr_rq_1 = 8'b00000010;
+        #60;
+
+        // CPU acknowledges
+        acknowledgement = 1;
+        #20 acknowledgement = 0;
+
+        // ISR DONE for line 1 -> 10100 + 001
+        data_bus_reg = 8'b10100001;
+        #40;
+    end
+
+ 
+    initial begin
+        #500;
+
+        // Command → Priority mode (10)
+        data_bus_reg = 8'b00000010;
+        #30;
+
+        // Load priority table entries (2 entries per cycle)
+        data_bus_reg = {3'd0,3'd1,2'b10}; #30;   // PT[0], PT[1]
+        data_bus_reg = {3'd2,3'd3,2'b10}; #30;   // PT[2], PT[3]
+        data_bus_reg = {3'd4,3'd5,2'b10}; #30;   // PT[4], PT[5]
+        data_bus_reg = {3'd6,3'd7,2'b10}; #30;   // PT[6], PT[7]
+
+        // Trigger interrupts on lines 3, 4, 7
+        intr_rq_1 = 8'b10011000;
+        #100;
+
+        // CPU acknowledges
+        acknowledgement = 1;
+        #20 acknowledgement = 0;
+
+        // ISR DONE → 01100 + intr_ptr
+        data_bus_reg = 8'b01100000;
+        #50;
+
+        $stop;
+    end
+
+endmodule

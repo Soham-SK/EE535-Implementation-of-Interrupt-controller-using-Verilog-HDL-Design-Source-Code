@@ -1,0 +1,140 @@
+
+module InterruptController_Priority (
+    input  wire        clock,
+    input  wire        reset,
+    input  wire [7:0]  intr_rq,
+    inout  wire [7:0]  data_bus,
+    input  wire        acknowledgement,
+    output wire        interrupt_out,
+    output wire        enable
+);
+
+    // FSM States
+    localparam S_RESET     = 3'd0,
+               S_LOAD      = 3'd1,
+               S_PRI_START = 3'd2,
+               S_TXPRI     = 3'd3,
+               S_ACK1      = 3'd4,
+               S_ACK2      = 3'd5;
+
+    reg [2:0] state, next_state;
+    reg [2:0] priority_table[0:7], next_priority_table[0:7];
+    reg [1:0] load_cycle, next_load_cycle;
+    reg [2:0] intr_ptr, next_intr_ptr;
+
+    reg oe, next_oe;
+    reg [7:0] intr_bus, next_intr_bus;
+    reg intr_out, next_intr_out;
+
+    integer i;
+
+    // Sequential
+    always @(posedge clock or posedge reset) begin
+        if (reset) begin
+            state <= S_RESET;
+            load_cycle <= 0;
+            intr_ptr <= 0;
+            oe <= 0;
+            intr_bus <= 8'hZZ;
+            intr_out <= 0;
+
+            for (i = 0; i < 8; i = i + 1)
+                priority_table[i] <= 0;
+        end else begin
+            state <= next_state;
+            load_cycle <= next_load_cycle;
+            intr_ptr <= next_intr_ptr;
+            oe <= next_oe;
+            intr_bus <= next_intr_bus;
+            intr_out <= next_intr_out;
+
+            for (i = 0; i < 8; i = i + 1)
+                priority_table[i] <= next_priority_table[i];
+        end
+    end
+
+    // Combinational
+    always @* begin
+        next_state = state;
+        next_load_cycle = load_cycle;
+        next_intr_ptr = intr_ptr;
+
+        next_oe = 0;
+        next_intr_out = 0;
+        next_intr_bus = 8'hZZ;
+
+        for (i = 0; i < 8; i = i + 1)
+            next_priority_table[i] = priority_table[i];
+
+        case (state)
+
+            S_RESET: begin
+                next_load_cycle = 0;
+                next_state = S_LOAD;
+            end
+
+            // Load custom priority table
+            S_LOAD: begin
+                case (load_cycle)
+                    0: begin
+                        next_priority_table[0] = data_bus[7:5];
+                        next_priority_table[1] = data_bus[4:2];
+                        next_load_cycle = 1;
+                    end
+                    1: begin
+                        next_priority_table[2] = data_bus[7:5];
+                        next_priority_table[3] = data_bus[4:2];
+                        next_load_cycle = 2;
+                    end
+                    2: begin
+                        next_priority_table[4] = data_bus[7:5];
+                        next_priority_table[5] = data_bus[4:2];
+                        next_load_cycle = 3;
+                    end
+                    3: begin
+                        next_priority_table[6] = data_bus[7:5];
+                        next_priority_table[7] = data_bus[4:2];
+                        next_state = S_PRI_START;
+                    end
+                endcase
+            end
+
+            // Find highest priority interrupt
+            S_PRI_START: begin
+                for (i = 0; i < 8; i = i + 1)
+                    if (intr_rq[priority_table[i]]) begin
+                        next_intr_ptr = priority_table[i];
+                        next_intr_out = 1;
+                        next_state = S_TXPRI;
+                    end
+            end
+
+            // Send interrupt vector
+            S_TXPRI: begin
+                if (!acknowledgement) begin
+                    next_intr_bus = {5'b10011, intr_ptr};
+                    next_oe = 1;
+                    next_state = S_ACK1;
+                end
+            end
+
+            S_ACK1: begin
+                if (!acknowledgement)
+                    next_state = S_ACK2;
+            end
+
+            S_ACK2: begin
+                if (!acknowledgement &&
+                    data_bus[7:3] == 5'b01100 &&
+                    data_bus[2:0] == intr_ptr)
+                    next_state = S_PRI_START;
+            end
+
+        endcase
+    end
+
+    assign interrupt_out = intr_out;
+    assign enable = oe;
+    assign data_bus = oe ? intr_bus : 8'hZZ;
+
+endmodule

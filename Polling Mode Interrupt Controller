@@ -1,0 +1,98 @@
+
+module InterruptController_Polling (
+    input  wire        clock,
+    input  wire        reset,
+    input  wire [7:0]  intr_rq,
+    inout  wire [7:0]  data_bus,
+    input  wire        acknowledgement,
+    output wire        interrupt_out,
+    output wire        enable
+);
+
+    // FSM States
+    localparam S_RESET  = 3'd0,
+               S_POLL   = 3'd1,
+               S_TXINFO = 3'd2,
+               S_ACK1   = 3'd3,
+               S_ACK2   = 3'd4;
+
+    reg [2:0] state, next_state;
+    reg [2:0] intr_index, next_intr_index;
+
+    reg oe, next_oe;
+    reg [7:0] intr_bus, next_intr_bus;
+    reg intr_out, next_intr_out;
+
+    // Sequential
+    always @(posedge clock or posedge reset) begin
+        if (reset) begin
+            state      <= S_RESET;
+            intr_index <= 0;
+            oe         <= 0;
+            intr_bus   <= 8'hZZ;
+            intr_out   <= 0;
+        end else begin
+            state      <= next_state;
+            intr_index <= next_intr_index;
+            oe         <= next_oe;
+            intr_bus   <= next_intr_bus;
+            intr_out   <= next_intr_out;
+        end
+    end
+
+    // Combinational
+    always @* begin
+        next_state      = state;
+        next_intr_index = intr_index;
+        next_oe         = 0;
+        next_intr_out   = 0;
+        next_intr_bus   = 8'hZZ;
+
+        case (state)
+
+            // Reset → Polling
+            S_RESET: begin
+                next_intr_index = 0;
+                next_state = S_POLL;
+            end
+
+            // Scan interrupt lines 0–7
+            S_POLL: begin
+                if (intr_rq[intr_index]) begin
+                    next_intr_out = 1;
+                    next_state = S_TXINFO;
+                end else begin
+                    next_intr_index = intr_index + 1;
+                end
+            end
+
+            // Send interrupt vector
+            S_TXINFO: begin
+                if (!acknowledgement) begin
+                    next_oe       = 1;
+                    next_intr_bus = {5'b01011, intr_index};
+                    next_state    = S_ACK1;
+                end
+            end
+
+            // CPU is receiving vector
+            S_ACK1: begin
+                if (!acknowledgement)
+                    next_state = S_ACK2;
+            end
+
+            // CPU sends ISR-DONE
+            S_ACK2: begin
+                if (!acknowledgement &&
+                    data_bus[7:3] == 5'b10100 &&
+                    data_bus[2:0] == intr_index)
+                    next_state = S_POLL;
+            end
+        endcase
+    end
+
+    assign interrupt_out = intr_out;
+    assign enable = oe;
+    assign data_bus = oe ? intr_bus : 8'hZZ;
+
+endmodule
