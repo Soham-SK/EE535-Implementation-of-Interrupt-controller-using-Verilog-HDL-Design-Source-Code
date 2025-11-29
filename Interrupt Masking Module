@@ -1,0 +1,20 @@
+
+module interrupt_masking_only (
+    input        clk,
+    input        enable,        // 1 = mask all interrupts, 0 = allow
+    input  [7:0] interrupt,     // Raw interrupt vector
+    output [7:0] masked_interrupt
+);
+
+    reg [7:0] mask_reg;
+
+    always @(posedge clk) begin
+        if (enable)
+            mask_reg <= 8'b00000000;  // All interrupts masked
+        else
+            mask_reg <= 8'b11111111;  // All interrupts allowed
+    end
+
+    assign masked_interrupt = interrupt & mask_reg;
+
+endmodule
